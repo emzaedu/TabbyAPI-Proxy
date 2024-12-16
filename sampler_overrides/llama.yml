@@ -1,0 +1,15 @@
+temperature:
+  override: 0.7
+  force: false
+top_k:
+  override: 40
+  force: false
+top_p:
+  override: 1
+  force: false
+presence_penalty:
+  override: 0
+  force: false
+frequency_penalty:
+  override: 0
+  force: false

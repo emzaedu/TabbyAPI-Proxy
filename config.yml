@@ -1,0 +1,45 @@
+network:
+  host: 127.0.0.1
+  port: 7001
+  disable_auth: true
+  send_tracebacks: false
+  api_servers: ["OAI"]
+
+logging:
+  log_prompt: false
+  log_generation_params: false
+  log_requests: false
+
+model:
+  model_dir: C:\Users\User\exl2
+  inline_model_loading: false
+  use_dummy_models: false
+  tensor_parallel: false
+  gpu_split_auto: false
+  autosplit_reserve: [0]
+  gpu_split: [25,25]
+  rope_alpha: 1.0
+  
+#draft_model:
+#  inline_model_loading: true
+#  draft_model_dir: models
+#  draft_model_name: Qwen2.5-Coder-0.5B-Instruct-exl2-4bpw-hb8
+#  draft_rope_scale: 
+#  draft_rope_alpha: 1.0
+#  draft_cache_mode: Q4
+
+lora:
+  lora_dir: loras
+  loras:
+
+embeddings:
+  embedding_model_dir: models
+  embeddings_device: cpu
+  embedding_model_name:
+
+developer:
+  unsafe_launch: false
+  disable_request_streaming: false
+  cuda_malloc_backend: false
+  uvloop: true
+  realtime_process_priority: true

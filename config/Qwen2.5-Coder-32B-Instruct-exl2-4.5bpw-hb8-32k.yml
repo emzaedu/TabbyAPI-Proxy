@@ -1,0 +1,9 @@
+model:
+  model_name: Qwen2.5-Coder-32B-Instruct-exl2-4.5bpw-hb8
+  cache_size: 32768
+  max_seq_len: 32768
+  cache_mode: Q4
+  chunk_size: 1024
+
+sampling:
+  override_preset: qwen

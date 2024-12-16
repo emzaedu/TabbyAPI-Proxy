@@ -1,0 +1,9 @@
+model:
+  model_name: Meta-Llama-3.1-8B-Instruct-exl2-8bpw-hb8
+  cache_size: 131072
+  max_seq_len: 131072
+  cache_mode: Q8
+  chunk_size: 1024
+  
+sampling:
+  override_preset: llama
