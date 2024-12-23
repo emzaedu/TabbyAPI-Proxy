@@ -4,6 +4,7 @@ from flask_cors import CORS
 from datetime import datetime, timezone
 from functools import wraps
 
+
 proxy_host = '127.0.0.1'
 proxy_port = 9000
 unload_timer = 300
@@ -42,6 +43,11 @@ else:
     logging.error("API tokens configuration file not found.")
     api_tokens = {}
 
+@app.before_request
+def log_request_info():
+    logging.debug(f"Headers: {request.headers}")
+    logging.debug(f"Body: {request.get_data(as_text=True)}")
+    
 def require_api_key(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -74,8 +80,9 @@ class ModelServer:
         self.last_access_time = None
         self.process_lock = threading.Lock()
         self.python_executable = sys.executable
-        self.model_params = None 
+        self.model_params = None
         self.draft_model_params = None
+        self.model_template = None
         threading.Thread(target=self.check_last_access_time, daemon=True).start()
 
     def start_model_process(self, model):
@@ -93,6 +100,7 @@ class ModelServer:
         
         self.model_params = model_config.get('model', {})
         self.draft_model_params = model_config.get('draft_model', {})
+        self.model_template = model_config.get('template', {})
         
         model_name = self.model_params.get('model_name')
         if not model_name:
@@ -124,6 +132,7 @@ class ModelServer:
             self.unload_timer = self.default_unload_timer
             self.model_params = None
             self.draft_model_params = None
+            self.model_template = None
 
     def check_server_ready(self):
         for _ in range(30):
@@ -239,7 +248,9 @@ def completions():
             max_seq_len = model_server.model_params.get('max_seq_len')
             if max_tokens is not None and max_seq_len is not None and max_tokens > max_seq_len:
                 logging.debug(f"max_tokens ({max_tokens}) is greater than max_seq_len ({max_seq_len}). Setting max_tokens to {max_seq_len}.")
+                #data['max_tokens'] = max_seq_len/2
                 data.pop('max_tokens', None)
+            data.pop('model', None)
             
             try:
                 with requests.post(f"{api_endpoint}/v1/completions", json=data, stream=True) as resp:
@@ -291,7 +302,27 @@ def proxy():
             max_seq_len = model_server.model_params.get('max_seq_len')
             if max_tokens is not None and max_seq_len is not None and max_tokens > max_seq_len:
                 logging.debug(f"max_tokens ({max_tokens}) is greater than max_seq_len ({max_seq_len}). Setting max_tokens to {max_seq_len}.")
+                #data['max_tokens'] = max_seq_len/2
                 data.pop('max_tokens', None)
+            
+            data.pop('model', None)
+                
+            template = model_server.model_template or {}
+            for param in ['top_p', 'top_k', 'temperature']:
+                if param not in data and param in template:
+                    data[param] = template[param]
+            
+            messages = data.get('messages', [])
+            system_instruction = template.get('system')
+            if system_instruction and (not messages or messages[0].get('role') != 'system'):
+                system_message = {
+                    "role": "system",
+                    "content": system_instruction
+                }
+                messages.insert(0, system_message)
+            data['messages'] = messages
+            
+            logging.debug(f"Modified request data: {json.dumps(data, ensure_ascii=False)}\n")
             
             try:
                 with requests.post(f"{api_endpoint}/v1/chat/completions", json=data, stream=True) as resp:
@@ -390,7 +421,7 @@ def ollama_chat():
             model_server.last_access_time = time.time()
             
             openai_data = {
-                "model": model.split(':')[0],
+                #"model": model.split(':')[0],
                 "messages": data.get('messages', []),
                 "stream": data.get('stream', True)
             }
@@ -507,7 +538,7 @@ def ollama_generate():
             model_server.last_access_time = time.time()
             
             openai_data = {
-                "model": model.split(':')[0],
+                #"model": model.split(':')[0],
                 "prompt": data.get('prompt', ''),
                 "suffix": data.get('suffix', ''),
                 "stream": data.get('stream', True)
