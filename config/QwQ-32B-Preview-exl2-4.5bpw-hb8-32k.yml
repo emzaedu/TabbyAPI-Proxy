@@ -1,0 +1,15 @@
+model:
+  model_name: QwQ-32B-Preview-exl2-4.5bpw-hb8
+  cache_size: 32768
+  max_seq_len: 32768
+  cache_mode: Q4
+  chunk_size: 1024
+
+sampling:
+  override_preset: qwq
+
+template:
+  system: "You are a helpful and harmless assistant. You are Qwen developed by Alibaba. You should think step-by-step."
+  top_p: 0.95
+  top_k: 20
+  temperature: 0.95
