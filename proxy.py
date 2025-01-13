@@ -123,7 +123,13 @@ class ModelServer:
     def stop_model_process(self):
         if self.current_process is not None:
             self.current_process.terminate()
-            self.current_process.wait()
+            try:
+                self.current_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logging.warning("Terminate failed. Killing...")
+                self.current_process.kill()
+                
+            #self.current_process.wait()
             logging.debug(f"Stopped process with PID {self.current_process.pid}")
             self.current_process = None
             self.server_ready = False
@@ -194,7 +200,8 @@ class ModelServer:
             "until" : until,
             "until_str": until_str,
             "model_params": self.model_params,
-            "draft_model_params": self.draft_model_params
+            "draft_model_params": self.draft_model_params,
+            "model_template": self.model_template
         }
             
 
@@ -206,13 +213,20 @@ def status():
     status_data = model_server.get_status()
     return jsonify(status_data)
 
-@app.route('/v1/unload', methods=['GET'])
+@app.route('/unload', methods=['GET'])
 @require_api_key
 def unload():
     #with model_server.process_lock:
     model_server.stop_model_process()
     logging.info(f"Stopping the model process.")
     response_data = { "status" : "success" }
+    return jsonify(response_data)
+
+@app.route('/api/show', methods=['GET','POST'])
+@require_api_key
+def api_show_dummy():
+    logging.info(f"Request: /api/show")
+    response_data = {"version": "0.0.1"}
     return jsonify(response_data)
 
 @app.route('/v1/completions', methods=['POST'])
@@ -222,7 +236,12 @@ def completions():
         with model_server.process_lock:
             data = request.json
             logging.debug(f"Received completions request data: {json.dumps(data, ensure_ascii=False)}\n")
-            
+            keep_alive = data.get('keep_alive')
+            if keep_alive is not None:
+                model_server.unload_timer = keep_alive
+            else:
+                model_server.unload_timer = model_server.default_unload_timer
+                
             model = data.get('model')
             if ':latest' in model:
                 model = model.split(':')[0]
@@ -248,10 +267,10 @@ def completions():
             max_seq_len = model_server.model_params.get('max_seq_len')
             if max_tokens is not None and max_seq_len is not None and max_tokens > max_seq_len:
                 logging.debug(f"max_tokens ({max_tokens}) is greater than max_seq_len ({max_seq_len}). Setting max_tokens to {max_seq_len}.")
-                #data['max_tokens'] = max_seq_len/2
                 data.pop('max_tokens', None)
             data.pop('model', None)
-            
+            data.pop('keep_alive', None)
+
             try:
                 with requests.post(f"{api_endpoint}/v1/completions", json=data, stream=True) as resp:
                     for line in resp.iter_lines():
@@ -276,10 +295,13 @@ def proxy():
         with model_server.process_lock:
             data = request.json
             logging.debug(f"Received request data: {json.dumps(data, ensure_ascii=False)}\n")
-            
+            keep_alive = data.get('keep_alive')
+            if keep_alive is not None:
+                model_server.unload_timer = keep_alive
+            else:
+                model_server.unload_timer = model_server.default_unload_timer
+                
             model = data.get('model')
-            if ':latest' in model:
-                model = model.split(':')[0]
             if model is not None and model_server.current_model != model:
                 logging.info(f"Model changed from {model_server.current_model} to {model}")
                 if not model_server.start_model_process(model):
@@ -302,26 +324,42 @@ def proxy():
             max_seq_len = model_server.model_params.get('max_seq_len')
             if max_tokens is not None and max_seq_len is not None and max_tokens > max_seq_len:
                 logging.debug(f"max_tokens ({max_tokens}) is greater than max_seq_len ({max_seq_len}). Setting max_tokens to {max_seq_len}.")
-                #data['max_tokens'] = max_seq_len/2
                 data.pop('max_tokens', None)
             
             data.pop('model', None)
+            data.pop('keep_alive', None)
+            
                 
             template = model_server.model_template or {}
-            for param in ['top_p', 'top_k', 'temperature']:
+            for param in ['top_p', 'min_p', 'top_k', 'temperature', 'num_predict', 'top_a', 'tfs', 'frequency_penalty', 'repeat_last_n', 'mirostat_mode', 'mirostat', 'mirostat_eta', 'mirostat_tau', 'repetition_penalty', 'presence_penalty', 'penalty_range', 'repetition_range', 'repetition_penalty_range', 'seed']:
                 if param not in data and param in template:
                     data[param] = template[param]
             
+            
+            local_time = datetime.now()
+            formatted_time = local_time.strftime('%H:%M:%S %Z%z')
+            formatted_date = local_time.strftime('%Y-%m-%d')
+            system_time_string = f"Current time:{formatted_time}\nToday: {formatted_date}\n\n"
+            
             messages = data.get('messages', [])
             system_instruction = template.get('system')
-            if system_instruction and (not messages or messages[0].get('role') != 'system'):
+            if system_instruction and (not messages or messages[0].get('role') != 'system') :
+                system_instruction = f"{system_time_string} {system_instruction}"
                 system_message = {
                     "role": "system",
                     "content": system_instruction
                 }
                 messages.insert(0, system_message)
-            data['messages'] = messages
+            elif messages[0].get('role') == 'system':
+                system_instruction = messages[0].get('content')
+                system_instruction = f"{system_time_string} {system_instruction}"
+                system_message = {
+                    "role": "system",
+                    "content": system_instruction
+                }
+                messages.insert(0, system_message)
             
+            data['messages'] = messages
             logging.debug(f"Modified request data: {json.dumps(data, ensure_ascii=False)}\n")
             
             try:
@@ -330,9 +368,16 @@ def proxy():
                         if line:
                             yield line + b"\n\n"
                             model_server.last_access_time = time.time()
-                            logging.debug(f"Streaming response: {line}")
+                            #logging.debug(f"Streaming response: {line}")
+                            try:
+                                json_str = line.decode('utf-8').replace('data: ', '')
+                                parsed_data = json.loads(json_str)
+                                content = parsed_data['choices'][0]['delta']['content']
+                                print(content,end="",flush=True)
+                            except:
+                                logging.debug("Can't parse response.")
                     logging.debug("Finished streaming response")
-                logging.debug("\n")
+                
             except requests.exceptions.RequestException as e:
                 logging.error(f"Request failed: {e}")
                 yield f"error: {str(e)}\n\n"
@@ -420,29 +465,66 @@ def ollama_chat():
             
             model_server.last_access_time = time.time()
             
+            local_time = datetime.now()
+            formatted_time = local_time.strftime('%H:%M:%S %Z%z')
+            formatted_date = local_time.strftime('%Y-%m-%d')
+            system_time_string = f"Current time:{formatted_time}\nToday: {formatted_date}\n\n"
+
+            messages = data.get('messages', [])
+            system_instruction = model_server.model_template.get('system')
+            if system_instruction:
+                if not messages or messages[0].get('role') != 'system':
+                    system_instruction = f"{system_time_string} {system_instruction}"
+                    system_message = {
+                        "role": "system",
+                        "content": system_instruction
+                    }
+                    messages.insert(0, system_message)
+                elif messages[0].get('role') == 'system':
+                    system_instruction = messages[0].get('content')
+                    system_instruction = f"{system_time_string} {system_instruction}"
+                    system_message = {
+                        "role": "system",
+                        "content": system_instruction
+                    }
+                    messages[0] = system_message  # Заменяем существующее системное сообщение
+            data['messages'] = messages
+            
+            template = model_server.model_template or {}
+            for param in ['top_p', 'min_p', 'top_k', 'temperature', 'num_predict', 'top_a', 'tfs', 'frequency_penalty', 'repeat_last_n', 'mirostat_mode', 'mirostat', 'mirostat_eta', 'mirostat_tau', 'repeat_penalty', 'presence_penalty', 'penalty_range', 'repetition_range', 'repetition_penalty_range', 'seed']:
+                if param in template:
+                    data[param] = template[param]
+            
+            options = data.get('options', {})
+            for param in ['top_p', 'min_p', 'top_k', 'temperature', 'num_predict', 'top_a', 'tfs_z', 'token_frequency_penalty', 'repeat_last_n', 'mirostat', 'mirostat_eta', 'mirostat_tau', 'repeat_penalty', 'seed']:
+                if param in options:
+                    data[param] = options[param]
+            
             openai_data = {
-                #"model": model.split(':')[0],
                 "messages": data.get('messages', []),
                 "stream": data.get('stream', True)
             }
-            options = data.get('options', {})
+            #options = data.get('options', {})
             openai_data.update({
                 #"max_tokens": options.get('num_ctx'),
-                #"max_tokens": options.get('num_predict')
                 #"min_tokens": options.get('min_tokens'),
-                "temperature": options.get('temperature',0.7),
-                "top_k": options.get('top_k',20),
-                "top_p": options.get('top_p',0.8),
-                "min_p": options.get('min_p'),
-                "top_a": options.get('top_a'),
-                "tfs": options.get('tfs_z'),
-                "token_frequency_penalty": options.get('frequency_penalty'),
-                "repeat_last_n": options.get('repeat_last_n'),
-                "mirostat": options.get('mirostat'),
-                "mirostat_eta": options.get('mirostat_eta'),
-                "mirostat_tau": options.get('mirostat_tau'),
-                "token_repetition_penalty": options.get('repeat_penalty')
-
+                #"seed": options.get('seed')
+                #"stop": options.get('stop')
+                #"repeat_penalty": options.get('repeat_penalty'),
+                #"tfs_z": options.get('tfs_z'),
+                "num_predict": data.get('num_predict'),
+                "temperature": data.get('temperature',0.7),
+                "top_k": data.get('top_k',20),
+                "top_p": data.get('top_p',0.8),
+                "min_p": data.get('min_p'),
+                "top_a": data.get('top_a'),
+                "tfs": data.get('tfs_z'),
+                "frequency_penalty": data.get('token_frequency_penalty'),
+                "repeat_last_n": data.get('repeat_last_n'),
+                "mirostat": data.get('mirostat'),
+                "mirostat_eta": data.get('mirostat_eta'),
+                "mirostat_tau": data.get('mirostat_tau'),
+                "repeat_penalty": data.get('repeat_penalty')
             })
             openai_data = {k: v for k, v in openai_data.items() if v is not None}
             
@@ -452,6 +534,13 @@ def ollama_chat():
                 with requests.post(f"{api_endpoint}/v1/chat/completions", json=openai_data, stream=True) as resp:
                     for line in resp.iter_lines():
                         if line:
+                            try:
+                                json_str = line.decode('utf-8').replace('data: ', '')
+                                parsed_data = json.loads(json_str)
+                                content = parsed_data['choices'][0]['delta']['content']
+                                print(content,end="",flush=True)
+                            except:
+                                logging.debug("Can't parse response.")
                             line = line.decode('utf-8')
                             if line.startswith('data: '):
                                 line = line[5:]
@@ -484,16 +573,15 @@ def ollama_chat():
                                 },
                                 "done": is_done
                             }
-                            yield json.dumps(ollama_response).encode('utf-8') + b"\n\n"
+                            yield json.dumps(ollama_response).encode('utf-8') + b"\n"
                             model_server.last_access_time = time.time()
-                            logging.debug(f"Streaming Ollama response: {json.dumps(ollama_response, ensure_ascii=False)}")
                     else:
                         ollama_response = {
                             "model": model,
                             "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
                             "done": True
                         }
-                        yield json.dumps(ollama_response).encode('utf-8') + b"\n\n"
+                        yield json.dumps(ollama_response).encode('utf-8') + b"\n"
                         logging.debug(f"Final Ollama response: {json.dumps(ollama_response, ensure_ascii=False)}")
                 logging.debug("\n")
             except requests.exceptions.RequestException as e:
@@ -537,6 +625,16 @@ def ollama_generate():
             
             model_server.last_access_time = time.time()
             
+            template = model_server.model_template or {}
+            for param in ['top_p', 'top_k', 'temperature']:
+                if param in template:
+                    data[param] = template[param]
+            
+            options = data.get('options', {})
+            for param in ['top_p', 'top_k', 'temperature']:
+                if param in options:
+                    data[param] = options[param]
+                    
             openai_data = {
                 #"model": model.split(':')[0],
                 "prompt": data.get('prompt', ''),
@@ -545,10 +643,17 @@ def ollama_generate():
             }
             options = data.get('options', {})
             openai_data.update({
-                "temperature": options.get('temperature', 0.7),
-                "top_k": options.get('top_k', 20),
-                "top_p": options.get('top_p', 0.8),
-                "min_p": options.get('min_p'),
+                #"max_tokens": options.get('num_ctx'),
+                #"min_tokens": options.get('min_tokens'),
+                #"seed": options.get('seed')
+                #"stop": options.get('stop')
+                "num_predict": options.get('num_predict'),
+                "repeat_penalty": options.get('repeat_penalty'),
+                "tfs_z": options.get('tfs_z'),
+                "temperature": data.get('temperature',0.7),
+                "top_k": data.get('top_k',20),
+                "top_p": data.get('top_p',0.8),
+                "min_p": data.get('min_p'),
                 "top_a": options.get('top_a'),
                 "tfs": options.get('tfs_z'),
                 "token_frequency_penalty": options.get('frequency_penalty'),
