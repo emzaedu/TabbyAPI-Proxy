@@ -21,9 +21,6 @@ proxy_running = False
 proxy_process = None
 unload_timer_thread = None
 
-system_prompt_time = True
-
-
 app = Flask(__name__)
 CORS(app)
 
@@ -46,10 +43,10 @@ else:
     logging.error("API tokens configuration file not found.")
     api_tokens = {}
 
-#@app.before_request
-#def log_request_info():
-#    logging.debug(f"Headers: {request.headers}")
-#    logging.debug(f"Body: {request.get_data(as_text=True)}")
+@app.before_request
+def log_request_info():
+    logging.debug(f"Request Headers: {request.headers}")
+    logging.debug(f"Request Body: {request.get_data(as_text=True)}")
     
 def require_api_key(f):
     @wraps(f)
@@ -216,7 +213,6 @@ class ModelServer:
         }
 
 model_server = ModelServer()
-
 
 def update_from_template(data, template):
     for param in [
@@ -410,7 +406,10 @@ def proxy():
             template = model_server.model_template or {}
             update_from_template(data, template)
             
-            if system_prompt_time:
+            print(model_server.model_template)
+            system_time = model_server.model_template.get("system_time", False)
+            print(system_time)
+            if system_time:
                 local_time = datetime.now()
                 formatted_time = local_time.strftime('%H:%M:%S %Z%z')
                 formatted_date = local_time.strftime('%Y-%m-%d')
@@ -419,7 +418,7 @@ def proxy():
             messages = data.get('messages', [])
             system_instruction = template.get('system')
             if system_instruction and (not messages or messages[0].get('role') != 'system') :
-                if system_prompt_time:
+                if system_time:
                     system_instruction = f"{system_time_string} {system_instruction}"
                 system_message = {
                     "role": "system",
@@ -428,7 +427,7 @@ def proxy():
                 messages.insert(0, system_message)
             elif messages[0].get('role') == 'system':
                 system_instruction = messages[0].get('content')
-                if system_prompt_time:
+                if system_time:
                     system_instruction = f"{system_time_string} {system_instruction}"
                 system_message = {
                     "role": "system",
@@ -536,7 +535,7 @@ def ollama_update_from_options(openai_data, options):
         if param in options:
             if param == 'top_k':
                 logging.debug(f"Original value of {param}: {options[param]}")
-                openai_data["top_k"] = int(float(options[param]))  # Явное преобразование в целое число
+                openai_data["top_k"] = int(float(options[param]))
                 logging.debug(f"Converted value of {param}: {openai_data['top_k']}")
             elif param == 'tfs_z':
                 openai_data["tfs"] = options[param]
@@ -581,7 +580,9 @@ def ollama_chat():
                 return
             
             model_server.last_access_time = time.time()
-            if system_prompt_time:
+            
+            system_time = model_server.model_template.get("system_time", False)
+            if system_time:
                 local_time = datetime.now()
                 formatted_time = local_time.strftime('%H:%M:%S %Z%z')
                 formatted_date = local_time.strftime('%Y-%m-%d')
@@ -591,7 +592,7 @@ def ollama_chat():
             system_instruction = model_server.model_template.get('system')
             if system_instruction:
                 if not messages or messages[0].get('role') != 'system':
-                    if system_prompt_time:
+                    if system_time:
                         system_instruction = f"{system_time_string} {system_instruction}"
                     system_message = {
                         "role": "system",
@@ -600,7 +601,7 @@ def ollama_chat():
                     messages.insert(0, system_message)
                 elif messages[0].get('role') == 'system':
                     system_instruction = messages[0].get('content')
-                    if system_prompt_time:
+                    if system_time:
                         system_instruction = f"{system_time_string} {system_instruction}"
                     system_message = {
                         "role": "system",
@@ -614,7 +615,7 @@ def ollama_chat():
                 "messages": data.get('messages', []),
                 "stream": data.get('stream', True)
             }
-            update_from_template(data, template)
+            update_from_template(openai_data, template)
             options = data.get('options', {})
             ollama_update_from_options(openai_data, options)
             openai_data = {k: v for k, v in openai_data.items() if v is not None}
@@ -632,7 +633,6 @@ def ollama_chat():
                                     else:
                                         parsed_data = json.loads(json_str)
                                         content = parsed_data['choices'][0]['delta']['content']
-                                        reply_txt += content
                                         print(content, end="", flush=True)
                                 except Exception as e:
                                     logging.debug(f"Can't parse response. {e}")
@@ -729,7 +729,7 @@ def ollama_generate():
             }
 
             template = model_server.model_template or {}
-            update_from_template(data, template)
+            update_from_template(openai_data, template)
             options = data.get('options', {})
             ollama_update_from_options(openai_data, options)
             openai_data = {k: v for k, v in openai_data.items() if v is not None}
