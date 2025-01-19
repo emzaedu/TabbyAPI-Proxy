@@ -1,0 +1,23 @@
+model:
+  model_name: Qwen2.5-Coder-32B-Instruct-exl2-4bpw-hb8
+  cache_size: 32768
+  max_seq_len: 32768
+  cache_mode: Q4
+  chunk_size: 1024
+
+sampling:
+  override_preset: qwen
+
+template:
+  system_time: True
+  system: "You are a helpful and harmless assistant. You are Qwen developed by Alibaba."
+  top_p: 0.8
+  top_k: 20
+  temperature: 0.7
+
+draft_model:
+  draft_model_dir: models
+  draft_model_name: Qwen2.5-Coder-0.5B-Instruct-exl2-4bpw-hb8
+  draft_rope_scale: 
+  draft_rope_alpha: 1.0
+  draft_cache_mode: FP16
