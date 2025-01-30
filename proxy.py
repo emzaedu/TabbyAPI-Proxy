@@ -99,7 +99,12 @@ class ModelServer:
             self.stop_model_process()
         
         global config_dir, model_dir
-        config_path = os.path.join(config_dir, f"{model}.yml")
+        config_path = os.path.join(config_dir, model.replace('/', os.sep) + '.yml')
+        
+        if not os.path.commonpath([os.path.abspath(config_path), os.path.abspath(config_dir)]) == os.path.abspath(config_dir):
+            logging.error(f"Attempted to access a forbidden path: {config_path}")
+            return False
+        
         if not os.path.exists(config_path):
             logging.error(f"Config file for model {model} not found.")
             return False
@@ -123,8 +128,9 @@ class ModelServer:
         
         self.current_process = subprocess.Popen([self.python_executable, "start.py", "--config", config_path])
         logging.debug(f"Started process for model {model} with PID {self.current_process.pid}")
-    
+        
         self.server_ready = False
+        self.server_ready_event.clear()
         threading.Thread(target=self.check_server_ready, args=()).start()
         self.last_access_time = time.time()
         return True
@@ -141,6 +147,7 @@ class ModelServer:
             logging.debug(f"Stopped process with PID {self.current_process.pid}")
             self.current_process = None
             self.server_ready = False
+            self.server_ready_event.clear()
             self.last_access_time = None
             self.current_model = None
             self.unload_timer = self.default_unload_timer
@@ -328,7 +335,7 @@ def completions():
                     break
                 time.sleep(1)
         
-            if not model_server.is_server_ready():
+            if not model_server.server_ready_event.wait(timeout=60):
                 yield json.dumps({"error": "Server is not ready"}).encode('utf-8') + b"\n\n"
                 return
             
@@ -388,7 +395,7 @@ def proxy():
                     break
                 time.sleep(1)
         
-            if not model_server.is_server_ready():
+            if not model_server.server_ready_event.wait(timeout=60):
                 yield json.dumps({"error": "Server is not ready"}).encode('utf-8') + b"\n\n"
                 return
             
@@ -472,8 +479,17 @@ def proxy():
 @require_api_key
 def models():
     global config_dir
-    model_files = [f for f in os.listdir(config_dir) if f.endswith('.yml')]
-    model_ids = [os.path.splitext(f)[0] for f in model_files]
+    model_files = []
+    
+    for root, dirs, files in os.walk(config_dir):
+        for file in files:
+            if file.endswith('.yml'):
+                relative_path = os.path.relpath(root, config_dir)
+                if relative_path == '.':
+                    model_id = os.path.splitext(file)[0]
+                else:
+                    model_id = os.path.join(relative_path, os.path.splitext(file)[0]).replace(os.sep, '/')
+                model_files.append(model_id)
     
     response_data = {
         "object": "list",
@@ -483,7 +499,7 @@ def models():
                 "object": "model",
                 "owned_by": "tabbyAPI"
             }
-            for model_id in model_ids
+            for model_id in model_files
         ]
     }
     return jsonify(response_data)
@@ -500,21 +516,25 @@ def version():
 @require_api_key
 def tags():
     global config_dir
-    model_files = [f for f in os.listdir(config_dir) if f.endswith('.yml')]
-    model_ids = [os.path.splitext(f)[0] for f in model_files]
+    model_files = []
     
-    models = []
-    for model_id in model_ids:
-        model_name = f"{model_id}:exl2"
-        models.append({
-            "name": model_name,
-            "model": model_name,
-            "digest": hashlib.sha256(model_name.encode('utf-8')).hexdigest()
-        })
+    for root, dirs, files in os.walk(config_dir):
+        for file in files:
+            if file.endswith('.yml'):
+                relative_path = os.path.relpath(root, config_dir)
+                if relative_path == '.':
+                    model_id = os.path.splitext(file)[0]
+                else:
+                    model_id = os.path.join(relative_path, os.path.splitext(file)[0]).replace(os.sep, '/')
+                model_name = f"{model_id}:exl2"
+                model_files.append({
+                    "name": model_name,
+                    "model": model_name,
+                    "digest": hashlib.sha256(model_name.encode('utf-8')).hexdigest()
+                })
     
-    response_data = {"models": models}
+    response_data = {"models": model_files}
     return jsonify(response_data)
-
 
 def ollama_update_from_options(openai_data, options):
     for param in [
@@ -575,7 +595,7 @@ def ollama_chat():
                     break
                 time.sleep(1)
         
-            if not model_server.is_server_ready():
+            if not model_server.server_ready_event.wait(timeout=60):
                 yield json.dumps({"error": "Server is not ready"}).encode('utf-8') + b"\n\n"
                 return
             
@@ -716,7 +736,7 @@ def ollama_generate():
                     break
                 time.sleep(1)
         
-            if not model_server.is_server_ready():
+            if not model_server.server_ready_event.wait(timeout=60):
                 yield json.dumps({"error": "Server is not ready"}).encode('utf-8') + b"\n\n"
                 return
 
