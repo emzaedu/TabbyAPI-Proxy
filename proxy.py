@@ -1,4 +1,4 @@
-import os, subprocess, time, threading, requests, json, logging, sys, yaml, hashlib, atexit
+import os, subprocess, time, threading, json, logging, sys, yaml, hashlib, atexit, requests, queue
 from flask import Flask, request, Response, stream_with_context, jsonify, make_response
 from flask_cors import CORS
 from datetime import datetime, timezone
@@ -7,9 +7,12 @@ from functools import wraps
 DEBUG_OUTPUT = True
 FLASK_DEBUG = True
 
+REQUEST_PRINT = False
+RESPONSE_PRINT = False
+
 PROXY_HOST = '127.0.0.1'
 PROXY_PORT = 9000
-DEFAULT_UNLOAD_TIMER = 86400
+DEFAULT_UNLOAD_TIMER = 900
 TABBY_API_ENDPOINT = "http://127.0.0.1:7001"
 OLLAMA_API_ENDPOINT = "http://127.0.0.1:11434"
 CONFIG_DIR = "config"
@@ -21,7 +24,8 @@ ALLOWED_HOSTS = ['api.externaldomain.com']
 app = Flask(__name__)
 CORS(app)
 
-logging.basicConfig(level=logging.DEBUG if DEBUG_OUTPUT else logging.INFO)
+logging.basicConfig(level=logging.DEBUG if DEBUG_OUTPUT else logging.INFO,
+                    format="%(asctime)s %(levelname)s: %(message)s")
 
 if os.path.exists(TABBY_CONFIG_PATH):
     with open(TABBY_CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -59,6 +63,13 @@ def require_api_key(func):
         return func(*args, **kwargs)
     return wrapper
 
+def stream_with_release(generator, release_func):
+    try:
+        for item in generator:
+            yield item
+    finally:
+        release_func()
+
 class ModelServer:
     _instance = None
 
@@ -69,21 +80,90 @@ class ModelServer:
         return cls._instance
 
     def init(self):
-        self.default_unload_timer = DEFAULT_UNLOAD_TIMER
-        self.unload_timer = DEFAULT_UNLOAD_TIMER
+        self.default_unload_timer = 900
+        self.unload_timer = self.default_unload_timer
+        self.lock = threading.Condition()
         self.current_model = None
-        self.current_process = None
+        self.active_requests = 0
+        self.switch_queue = queue.Queue()
         self.server_ready = False
         self.server_ready_event = threading.Event()
         self.last_access_time = None
-        self.process_lock = threading.Lock()
         self.python_executable = sys.executable
         self.model_params = None
         self.draft_model_params = None
         self.model_template = None
         self.current_source = None
+        threading.Thread(target=self.switch_worker, daemon=True).start()
         threading.Thread(target=self.check_last_access_time, daemon=True).start()
         atexit.register(self.stop_model_process)
+
+    def acquire_model_lock(self, data):
+        requested_model = data.get('model')
+        if not requested_model:
+            return False, "Model ID is required"
+        model_info = get_model_info(requested_model)
+        if not model_info:
+            return False, "Model not found"
+
+        with self.lock:
+            if self.current_model is None:
+                success, err = prepare_model_request(data)
+                if not success:
+                    return False, err
+                self.current_model = requested_model
+                self.active_requests += 1
+                logging.debug(f"acquire_model_lock: Loaded model '{requested_model}', active_requests={self.active_requests}")
+                return True, None
+            if self.current_model == requested_model:
+                self.active_requests += 1
+                logging.debug(f"acquire_model_lock: Model '{requested_model}' already active, active_requests={self.active_requests}")
+                return True, None
+            switch_event = threading.Event()
+            self.switch_queue.put((requested_model, switch_event))
+            logging.debug(f"acquire_model_lock: Registered switch request for model '{requested_model}'. Queue size={self.switch_queue.qsize()}")
+        
+        switch_event.wait()
+        with self.lock:
+            if self.current_model != requested_model:
+                return False, "Model switch did not occur as expected"
+            self.active_requests += 1
+            logging.debug(f"acquire_model_lock: After switch, model '{requested_model}' active, active_requests={self.active_requests}")
+            return True, None
+
+    def release_model_lock(self):
+        with self.lock:
+            self.active_requests -= 1
+            logging.debug(f"release_model_lock: active_requests decreased to {self.active_requests}")
+            if self.active_requests == 0:
+                self.lock.notify_all()
+
+    def switch_worker(self):
+        while True:
+            with self.lock:
+                if self.active_requests > 0 or self.switch_queue.empty():
+                    self.lock.wait(timeout=1)
+                    continue
+            try:
+                target_model, event = self.switch_queue.get_nowait()
+            except queue.Empty:
+                continue
+            with self.lock:
+                if self.active_requests > 0:
+                    self.switch_queue.put((target_model, event))
+                    continue
+                dummy_data = {'model': target_model}
+                success, err = prepare_model_request(dummy_data)
+                if success:
+                    old_model = self.current_model
+                    self.current_model = target_model
+                    logging.info(f"switch_worker: Model switched from '{old_model}' to '{target_model}'")
+                    self.lock.notify_all()
+                    event.set()
+                else:
+                    logging.error(f"switch_worker: Failed to switch to '{target_model}': {err}")
+                    self.switch_queue.put((target_model, event))
+            time.sleep(0.1)
 
     def stop_model_process(self):
         try:
@@ -95,41 +175,42 @@ class ModelServer:
             logging.error(f"Error stopping model process: {e}")
 
     def start_model_process_tabby(self, model):
-        if self.current_process is not None:
+        if hasattr(self, 'current_process') and self.current_process is not None:
             self.stop_model_process()
-
         config_path = os.path.join(CONFIG_DIR, model.replace('/', os.sep) + '.yml')
         if not os.path.commonprefix([os.path.abspath(config_path), os.path.abspath(CONFIG_DIR)]).startswith(os.path.abspath(CONFIG_DIR)):
-            logging.error(f"Attempted to access forbidden path: {config_path}")
+            logging.error(f"start_model_process_tabby: Forbidden path: {config_path}")
             return False
         if not os.path.exists(config_path):
-            logging.error(f"Config file for model {model} not found.")
+            logging.error(f"start_model_process_tabby: Config file for model {model} not found.")
             return False
-
         with open(config_path, 'r', encoding='utf-8') as f:
             model_config = yaml.safe_load(f)
-
         self.model_params = model_config.get('model', {})
         self.draft_model_params = model_config.get('draft_model', {})
         self.model_template = model_config.get('template', {})
-
         model_name = self.model_params.get('model_name')
         if not model_name:
-            logging.error(f"Model name not found in config file for model {model}.")
+            logging.error(f"start_model_process_tabby: Model name not found for model {model}.")
             return False
-
         model_path = os.path.join(MODEL_DIR, model_name)
         if not os.path.exists(model_path):
-            logging.error(f"Model directory for model {model} not found: {model_path}")
+            logging.error(f"start_model_process_tabby: Model directory not found: {model_path}")
             return False
-
-        self.unload_timer = self.model_params.get('unload_timer', DEFAULT_UNLOAD_TIMER)
-        logging.debug(f"Started unload timer is {self.unload_timer}s.")
-
-        self.current_process = subprocess.Popen(
-            [self.python_executable, "start.py", "--config", config_path]
-        )
-        logging.debug(f"Started process for model {model} with PID {self.current_process.pid}")
+        self.unload_timer = self.model_params.get('unload_timer', self.default_unload_timer)
+        logging.debug(f"start_model_process_tabby: Unload timer set to {self.unload_timer}s.")
+        if DEBUG_OUTPUT:
+            self.current_process = subprocess.Popen(
+                [self.python_executable, "start.py", "--config", config_path]
+            )
+        else:
+            self.current_process = subprocess.Popen(
+                [self.python_executable, "start.py", "--config", config_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        logging.debug(f"start_model_process_tabby: Process for model {model} started with PID {self.current_process.pid}")
         self.server_ready = False
         self.server_ready_event.clear()
         threading.Thread(target=self.check_server_ready, daemon=True).start()
@@ -144,9 +225,9 @@ class ModelServer:
             try:
                 self.current_process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                logging.warning("Terminate failed. Killing process...")
+                logging.warning("stop_model_process_tabby: Terminate failed. Killing process...")
                 self.current_process.kill()
-            logging.debug(f"Stopped process with PID {self.current_process.pid}")
+            logging.debug(f"stop_model_process_tabby: Process with PID {self.current_process.pid} stopped")
             self.current_process = None
             self.server_ready = False
             self.server_ready_event.clear()
@@ -159,16 +240,16 @@ class ModelServer:
             self.model_template = None
 
     def start_model_process_ollama(self, model):
-        logging.info(f"Loading Ollama model: {model}")
+        logging.info(f"start_model_process_ollama: Loading Ollama model: {model}")
         self.current_model = model
         self.current_source = "ollama"
         self.last_access_time = time.time()
-        self.unload_timer = self.model_params.get('unload_timer', DEFAULT_UNLOAD_TIMER) if self.model_params else DEFAULT_UNLOAD_TIMER
+        self.unload_timer = self.model_params.get('unload_timer', self.default_unload_timer) if self.model_params else self.default_unload_timer
         return True
 
     def stop_model_process_ollama(self, model):
         try:
-            logging.info(f"Unloading Ollama model: {model}")
+            logging.info(f"stop_model_process_ollama: Unloading Ollama model: {model}")
             response = requests.post(f"{OLLAMA_API_ENDPOINT}/api/chat", json={"model": model, "messages": [], "keep_alive": 0})
             response.raise_for_status()
             for _ in range(30):
@@ -176,14 +257,14 @@ class ModelServer:
                 ps_response.raise_for_status()
                 ps_data = ps_response.json()
                 if not ps_data.get('models', []):
-                    logging.info(f"Model {model} successfully unloaded.")
+                    logging.info(f"stop_model_process_ollama: Model {model} successfully unloaded.")
                     break
                 time.sleep(1)
         except requests.exceptions.RequestException as e:
-            logging.error(f"Failed to unload model {model}: {e}")
+            logging.error(f"stop_model_process_ollama: Failed to unload model {model}: {e}")
             return False
         except Exception as e:
-            logging.error(f"Unexpected error during unloading Ollama model {model}: {e}")
+            logging.error(f"stop_model_process_ollama: Unexpected error unloading model {model}: {e}")
             return False
         self.current_model = None
         self.current_source = None
@@ -197,7 +278,7 @@ class ModelServer:
             models = response.json().get('models', [])
             return any(m['name'] == model for m in models)
         except requests.exceptions.RequestException as e:
-            logging.error(f"Failed to check Ollama model status: {e}")
+            logging.error(f"is_ollama_model_loaded: Failed to check model {model}: {e}")
             return False
 
     def is_server_ready(self, endpoint):
@@ -206,7 +287,7 @@ class ModelServer:
             response = requests.get(url, timeout=2)
             return response.status_code == 200
         except requests.exceptions.RequestException as e:
-            logging.debug(f"Failed to check server readiness at {endpoint}: {e}")
+            logging.debug(f"is_server_ready: Failed at {endpoint}: {e}")
             return False
 
     def check_server_ready(self):
@@ -215,11 +296,11 @@ class ModelServer:
             if self.is_server_ready(endpoint):
                 self.server_ready = True
                 self.server_ready_event.set()
-                logging.debug("Server is ready.")
+                logging.debug("check_server_ready: Server is ready.")
                 break
             time.sleep(1)
         else:
-            logging.error("Server is not ready after 30 seconds. Terminating process.")
+            logging.error("check_server_ready: Server not ready after 30 seconds. Terminating process.")
             self.stop_model_process()
 
     def check_last_access_time(self):
@@ -227,7 +308,7 @@ class ModelServer:
             if self.last_access_time is not None:
                 elapsed = time.time() - self.last_access_time
                 if elapsed > self.unload_timer:
-                    logging.info(f"No requests for {elapsed} seconds. Stopping the model process.")
+                    logging.info(f"check_last_access_time: No requests for {elapsed} seconds. Stopping model process.")
                     self.stop_model_process()
             time.sleep(5)
 
@@ -252,7 +333,6 @@ class ModelServer:
                 until_str = f"{hours}h {minutes}m {seconds}s"
         else:
             until_str = None
-
         return {
             "model": model,
             "until": until,
@@ -283,7 +363,8 @@ def update_from_template(data, template):
         if param not in data and param in template:
             data[param] = template[param]
             logging.debug(f"Parameter {param} set from template: {data[param]}")
-
+    data.pop('model', None)
+    
 def inject_system_message(data, template):
     system_time_flag = template.get("system_time", False)
     system_time_str = ""
@@ -308,9 +389,13 @@ def inject_system_message(data, template):
 def enforce_max_tokens_limit(data):
     max_tokens = data.get('max_tokens')
     max_seq_len = model_server.model_params.get('max_seq_len') if model_server.model_params else None
-    if max_tokens is not None and max_seq_len is not None and max_tokens > max_seq_len:
-        logging.debug(f"max_tokens ({max_tokens}) is greater than max_seq_len ({max_seq_len}). Removing max_tokens.")
-        data.pop('max_tokens', None)
+    if max_tokens is not None:
+        if max_tokens < 4:
+            logging.debug(f"max_tokens ({max_tokens}) is less than 4. Removing max_tokens.")
+            data.pop('max_tokens', None)
+        if max_seq_len is not None and max_tokens > max_seq_len:
+            logging.debug(f"max_tokens ({max_tokens}) is greater than max_seq_len ({max_seq_len}). Removing max_tokens.")
+            data.pop('max_tokens', None)
 
 def list_model_ids():
     tabby_model_ids = []
@@ -347,6 +432,7 @@ def ollama_update_from_options(openai_data, options):
             else:
                 openai_data[param] = options[param]
             logging.debug(f"Parameter {param} set from options: {options[param]}")
+    openai_data.pop('model', None)
 
 def stream_error_gen(error_message):
     def generator():
@@ -357,16 +443,13 @@ def prepare_model_request(data):
     model = data.get('model')
     if not model:
         return False, "Model parameter is missing."
-
     model_info = get_model_info(model)
     if not model_info:
         return False, "Model not found."
     source = model_info['source']
-
     if model != model_server.current_model:
         logging.info(f"Model changed: {model_server.current_model} -> {model}")
         model_server.stop_model_process()
-
         if source == "tabbyAPI":
             if not model_server.start_model_process_tabby(model):
                 return False, f"Config file for model {model} not found."
@@ -376,10 +459,8 @@ def prepare_model_request(data):
                 return False, f"Failed to load model {model} on Ollama."
         else:
             return False, "Unknown model source."
-
         model_server.current_model = model
         model_server.current_source = source
-
     for _ in range(60):
         endpoint = TABBY_API_ENDPOINT if model_server.current_source == "tabbyAPI" else OLLAMA_API_ENDPOINT
         if model_server.is_server_ready(endpoint):
@@ -387,7 +468,6 @@ def prepare_model_request(data):
         time.sleep(1)
     if source == "tabbyAPI" and not model_server.server_ready_event.wait(timeout=60):
         return False, "Server is not ready"
-
     if 'keep_alive' in data:
         model_server.unload_timer = data['keep_alive']
     else:
@@ -396,6 +476,7 @@ def prepare_model_request(data):
             data['keep_alive'] = DEFAULT_UNLOAD_TIMER
     model_server.last_access_time = time.time()
     return True, None
+
 
 @app.route('/', methods=['GET'])
 @require_api_key
@@ -425,141 +506,145 @@ def api_show_dummy():
 @app.route('/v1/completions', methods=['POST'])
 @require_api_key
 def completions():
-    with model_server.process_lock:
-        data = request.json
-        logging.debug(f"Received completions request data: {json.dumps(data, ensure_ascii=False)}")
-        model_id = data.get('model')
-        is_stream = data.get('stream', True)
-        if not model_id:
-            return jsonify({"error": "Model ID is required"}), 400
-
-        model_info = get_model_info(model_id)
-        if not model_info:
-            return jsonify({"error": "Model not found"}), 404
-
-        success, error_message = prepare_model_request(data)
-        if not success:
-            if is_stream:
-                return Response(stream_with_context(stream_error_gen(error_message)()), content_type="application/json")
-            return jsonify({"error": error_message})
-
-        source = model_info['source']
-        if source == "tabbyAPI":
-            api_endpoint = TABBY_API_ENDPOINT
-            template = model_server.model_template or {}
-            update_from_template(data, template)
-        elif source == "ollama":
-            api_endpoint = OLLAMA_API_ENDPOINT
-        else:
-            return jsonify({"error": "Unknown model source"}), 500
-
-        enforce_max_tokens_limit(data)
-
+    data = request.json
+    logging.debug(f"Received completions request data: {json.dumps(data, ensure_ascii=False)}")
+    requested_model = data.get('model')
+    is_stream = data.get('stream', True)
+    if not requested_model:
+        return jsonify({"error": "Model ID is required"}), 400
+    model_info = get_model_info(requested_model)
+    if not model_info:
+        return jsonify({"error": "Model not found"}), 404
+    success, error_message = model_server.acquire_model_lock(data)
+    if not success:
         if is_stream:
-            def generate():
-                try:
-                    with requests.post(f"{api_endpoint}/v1/completions", json=data, stream=True) as resp:
-                        for line in resp.iter_lines():
-                            if line:
-                                yield line + b"\n\n"
-                                model_server.last_access_time = time.time()
-                                logging.debug(f"Streaming response: {line}")
-                        logging.debug("Finished streaming response")
-                except requests.exceptions.RequestException as e:
-                    logging.error(f"Request failed: {e}")
-                    yield f"error: {str(e)}\n\n".encode('utf-8')
-            return Response(stream_with_context(generate()), content_type="application/json")
-        else:
+            return Response(stream_with_context(stream_error_gen(error_message)()), content_type="application/json")
+        return jsonify({"error": error_message})
+    if is_stream:
+        def generate():
             try:
-                with requests.post(f"{api_endpoint}/v1/completions", json=data, stream=False) as resp:
-                    try:
-                        result = resp.json()
-                    except json.JSONDecodeError:
-                        return jsonify({"error": "Failed to decode JSON response from model server."})
-                model_server.last_access_time = time.time()
-                return jsonify(result)
+                with requests.post(f"{TABBY_API_ENDPOINT if model_info['source']=='tabbyAPI' else OLLAMA_API_ENDPOINT}/v1/completions", json=data, stream=True) as resp:
+                    for line in resp.iter_lines():
+                        if line:
+                            yield line + b"\n\n"
+                            model_server.last_access_time = time.time()
+                            logging.debug(f"Streaming response: {line}")
+                    logging.debug("Finished streaming response")
             except requests.exceptions.RequestException as e:
                 logging.error(f"Request failed: {e}")
-                return jsonify({"error": str(e)})
+                yield f"error: {str(e)}\n\n".encode('utf-8')
+        return Response(stream_with_context(stream_with_release(generate(), model_server.release_model_lock)), content_type="text/event-stream")
+    else:
+        try:
+            resp = requests.post(f"{TABBY_API_ENDPOINT if model_info['source']=='tabbyAPI' else OLLAMA_API_ENDPOINT}/v1/completions", json=data, stream=False)
+            try:
+                result = resp.json()
+            except json.JSONDecodeError:
+                return jsonify({"error": "Failed to decode JSON response from model server."})
+            model_server.last_access_time = time.time()
+            return resp
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed: {e}")
+            return jsonify({"error": str(e)})
+        finally:
+            model_server.release_model_lock()
 
 @app.route('/v1/chat/completions', methods=['POST'])
 @require_api_key
 def chat_completions():
-    with model_server.process_lock:
-        data = request.json
-        logging.debug(f"Received chat completions request data: {json.dumps(data, ensure_ascii=False)}")
-        model_id = data.get('model')
-        is_stream = data.get('stream', True)
-
-        if not model_id:
-            return jsonify({"error": "Model ID is required"}), 400
-
-        model_info = get_model_info(model_id)
-        if not model_info:
-            return jsonify({"error": "Model not found"}), 404
-
-        success, error_message = prepare_model_request(data)
-        if not success:
-            if is_stream:
-                return Response(stream_with_context(stream_error_gen(error_message)()), content_type="application/json")
-            return jsonify({"error": error_message})
-
-        source = model_info['source']
-        if source == "tabbyAPI":
-            api_endpoint = TABBY_API_ENDPOINT
-            template = model_server.model_template or {}
-            update_from_template(data, template)
-            inject_system_message(data, template)
-            openai_data = data
-        elif source == "ollama":
-            api_endpoint = OLLAMA_API_ENDPOINT
-            openai_data = data
-        else:
-            return jsonify({"error": "Unknown model source"}), 500
-
-        enforce_max_tokens_limit(data)
-        logging.debug(f"Modified request data: {json.dumps(openai_data, ensure_ascii=False)}")
+    data = request.json
+    if DEBUG_OUTPUT or REQUEST_PRINT:
+        print(f"\nOriginal request:\n{json.dumps(data, indent=4)}\n---------------------------------\n")
+    logging.debug(f"Received chat completions request data: {json.dumps(data, ensure_ascii=False)}")
+    requested_model = data.get('model')
+    is_stream = data.get('stream', True)
+    if not requested_model:
+        return jsonify({"error": "Model ID is required"}), 400
+    model_info = get_model_info(requested_model)
+    if not model_info:
+        return jsonify({"error": "Model not found"}), 404
+    success, error_message = model_server.acquire_model_lock(data)
+    if not success:
         if is_stream:
-            def generate():
-                try:
-                    with requests.post(f"{api_endpoint}/v1/chat/completions", json=openai_data, stream=True) as resp:
-                        if DEBUG_OUTPUT:
-                            print("Started streaming /v1/chat/completions response:\n", end="", flush=True)
-                        for line in resp.iter_lines():
-                            if line:
-                                yield line + b"\n\n"
-                                model_server.last_access_time = time.time()
-                                logging.debug(f"Streaming response: {line}")
-                                if DEBUG_OUTPUT:
-                                    try:
-                                        json_str = line.decode('utf-8').replace('data: ', '')
-                                        if json_str == '[DONE]':
-                                            logging.debug("Stream finished")
-                                        else:
-                                            parsed_data = json.loads(json_str)
-                                            if 'content' in parsed_data['choices'][0]['delta']:
-                                                content = parsed_data['choices'][0]['delta']['content']
-                                                print(content, end="", flush=True)
-                                    except Exception as e:
-                                        logging.debug(f"Can't parse response. {e}")
-                        print("\n", end="", flush=True)
-                        logging.debug("Finished streaming /v1/chat/completions response")
-                except requests.exceptions.RequestException as e:
-                    logging.error(f"Request failed: {e}")
-                    yield f"error: {str(e)}\n\n".encode('utf-8')
-            return Response(stream_with_context(generate()), content_type="text/event-stream")
-        else:
+            return Response(stream_with_context(stream_error_gen(error_message)()), content_type="application/json")
+        return jsonify({"error": error_message})
+    if model_info['source'] == "tabbyAPI":
+        api_endpoint = TABBY_API_ENDPOINT
+        template = model_server.model_template or {}
+        update_from_template(data, template)
+        inject_system_message(data, template)
+        openai_data = data
+    elif model_info['source'] == "ollama":
+        api_endpoint = OLLAMA_API_ENDPOINT
+        openai_data = data
+    else:
+        model_server.release_model_lock()
+        return jsonify({"error": "Unknown model source"}), 500
+    enforce_max_tokens_limit(data)
+    if DEBUG_OUTPUT or REQUEST_PRINT:
+        print(f"\nModified request:\n{json.dumps(openai_data, ensure_ascii=False, indent=4)}\n---------------------------------\n")
+    if is_stream:
+        def generate():
             try:
-                with requests.post(f"{api_endpoint}/v1/chat/completions", json=openai_data, stream=False) as resp:
-                    try:
-                        result = resp.json()
-                    except json.JSONDecodeError:
-                        return jsonify({"error": "Failed to decode JSON response from model server."})
-                model_server.last_access_time = time.time()
-                return jsonify(result)
+                with requests.post(f"{api_endpoint}/v1/chat/completions", json=openai_data, stream=True) as resp:
+                    if DEBUG_OUTPUT or RESPONSE_PRINT:
+                        print(f"\n\nResponse:\n\n")
+                    for line in resp.iter_lines():
+                        if line:
+                            yield line + b"\n\n"
+                            line_decoded = line.decode('utf-8')
+                            if line_decoded.startswith('data: '):
+                                line_decoded = line_decoded[5:]
+                            if line_decoded.strip() == '[DONE]':
+                                logging.debug("Received [DONE] signal. Finishing response stream.")
+                                break
+                            try:
+                                openai_response = json.loads(line_decoded)
+                            except json.JSONDecodeError:
+                                logging.error(f"Failed to decode JSON: {line_decoded}")
+                                continue
+                            delta = openai_response.get("choices", [{}])[0].get("delta", {})
+                            if openai_response.get("finish_reason", "") == "":
+                                is_done = False
+                                pass
+                            else:
+                                print(openai_response, end="", flush=True)
+                                is_done = openai_response.get("finish_reason", "") == "stop"
+                            if is_done:
+                                if DEBUG_OUTPUT:
+                                    logging.debug("Stream finished")
+                                break
+                            if DEBUG_OUTPUT or RESPONSE_PRINT:
+                                try:
+                                    if 'choices' in openai_response and 'delta' in openai_response['choices'][0] and 'content' in openai_response['choices'][0]['delta']:
+                                        content = openai_response['choices'][0]['delta']['content']
+                                        print(content, end="", flush=True)
+                                except Exception as e:
+                                    if DEBUG_OUTPUT:
+                                        logging.debug(f"Can't parse response. {e}")
+                            model_server.last_access_time = time.time()
+                    if DEBUG_OUTPUT or RESPONSE_PRINT:
+                        print(f"\n---------------------------------\n")
+                    if DEBUG_OUTPUT:
+                        logging.info("Finished streaming /v1/chat/completions response")
             except requests.exceptions.RequestException as e:
                 logging.error(f"Request failed: {e}")
-                return jsonify({"error": str(e)})
+                yield f"error: {str(e)}\n\n".encode('utf-8')
+        return Response(stream_with_context(stream_with_release(generate(), model_server.release_model_lock)), content_type="text/event-stream", direct_passthrough=True)
+    else:
+        try:
+            with requests.post(f"{api_endpoint}/v1/chat/completions", json=openai_data, stream=False) as resp:
+                try:
+                    result = resp.json()
+                except json.JSONDecodeError:
+                    return jsonify({"error": "Failed to decode JSON response from model server."})
+            model_server.last_access_time = time.time()
+            return jsonify(result)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed: {e}")
+            return jsonify({"error": str(e)})
+        finally:
+            model_server.release_model_lock()
 
 @app.route('/v1/models', methods=['GET'])
 @require_api_key
@@ -606,239 +691,331 @@ def tags():
 @require_api_key
 def ollama_chat():
     def generate():
-        with model_server.process_lock:
-            data = request.json
-            logging.debug(f"Received Ollama chat request data: {json.dumps(data, ensure_ascii=False)}")
-            is_stream = data.get('stream', True)
-            ollama_model = data.get('model')
-            if ':exl2' in ollama_model:
-                ollama_model = ollama_model.split(':')[0]
-            data['model'] = ollama_model
-
-            if not ollama_model:
-                logging.debug("Ollama Model ID is required")
-                yield json.dumps({"error": "Model ID is required"}).encode('utf-8') + b"\n\n"
-                return
-            model_info = get_model_info(ollama_model)
-            if not model_info:
-                logging.debug("Ollama Model not found")
-                yield json.dumps({"error": "Model not found"}).encode('utf-8') + b"\n\n"
-                return
-            source = model_info['source']
-
-            success, error_message = prepare_model_request(data)
-            if not success:
-                logging.debug(f"Ollama Prepare Model error: {error_message}")
-                yield json.dumps({"error": error_message}).encode('utf-8') + b"\n\n"
-                return
-
-            if source == "tabbyAPI":
-                endpoint = TABBY_API_ENDPOINT
-                template = model_server.model_template or {}
-                inject_system_message(data, template)
-                logging.debug(f"Modified Ollama chat request data: {json.dumps(data, ensure_ascii=False)}")
-                openai_data = {"messages": data.get('messages', []), "stream": is_stream}
-                update_from_template(openai_data, template)
-                options = data.get('options', {})
-                ollama_update_from_options(openai_data, options)
-                openai_data = {k: v for k, v in openai_data.items() if v is not None}
-            elif source == "ollama":
-                endpoint = OLLAMA_API_ENDPOINT
-                openai_data = data
-            else:
-                yield json.dumps({"error": "Unknown model source"}).encode('utf-8') + b"\n\n"
-                return
-
-            try:
-                if openai_data.get("stream"):
-                    with requests.post(f"{endpoint}/v1/chat/completions", json=openai_data, stream=True) as resp:
-                        if DEBUG_OUTPUT:
-                            print("Started streaming /v1/chat/completions response:\n", end="", flush=True)
-                        for line in resp.iter_lines():
-                            if line:
-                                line_str = line.decode('utf-8')
-                                if line_str.startswith('data: '):
-                                    line_str = line_str[5:]
-                                if line_str.strip() == '[DONE]':
-                                    logging.debug("Received [DONE] signal. Finishing response stream.")
-                                    break
-                                try:
-                                    openai_response = json.loads(line_str)
-                                except json.JSONDecodeError:
-                                    logging.error(f"Failed to decode JSON: {line_str}")
-                                    continue
-                                delta = openai_response.get("choices", [{}])[0].get("delta", {})
-                                role = delta.get("role", "")
-                                content = delta.get("content", "")
-                                is_done = openai_response.get("finish_reason", "") == "stop"
-                                ollama_response = {
-                                    "model": ollama_model,
-                                    "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-                                    "message": {"role": role, "content": content, "images": None},
-                                    "done": is_done
-                                }
-                                yield json.dumps(ollama_response).encode('utf-8') + b"\n"
-                                model_server.last_access_time = time.time()
-                                if DEBUG_OUTPUT:
-                                    try:
-                                        print(content, end="", flush=True)
-                                    except Exception as e:
-                                        logging.debug(f"Can't print content. {e}")
-                        else:
+        data = request.json
+        if REQUEST_PRINT:
+            print(f"\n---------------------------------\nOriginal /api/chat request:\n\n{data}\n\n---------------------------------\n")
+        logging.debug(f"Received Ollama chat request data: {json.dumps(data, ensure_ascii=False)}")
+        is_stream = data.get('stream', True)
+        data['stream'] = is_stream
+        ollama_model = data.get('model')
+        if ':exl2' in ollama_model:
+            ollama_model = ollama_model.split(':')[0]
+        data['model'] = ollama_model
+        if not ollama_model:
+            logging.debug("Ollama Model ID is required")
+            yield json.dumps({"error": "Model ID is required"}).encode('utf-8') + b"\n\n"
+            return
+        model_info = get_model_info(ollama_model)
+        if not model_info:
+            logging.debug("Ollama Model not found")
+            yield json.dumps({"error": "Model not found"}).encode('utf-8') + b"\n\n"
+            return
+        source = model_info['source']
+        success, error_message = model_server.acquire_model_lock(data)
+        if not success:
+            yield json.dumps({"error": error_message}).encode('utf-8') + b"\n\n"
+            return
+        if source == "tabbyAPI":
+            api_endpoint = TABBY_API_ENDPOINT
+            template = model_server.model_template or {}
+            inject_system_message(data, template)
+            openai_data = {"messages": data.get('messages', []), "stream": is_stream}
+            update_from_template(openai_data, template)
+            options = data.get('options', {})
+            ollama_update_from_options(openai_data, options)
+            openai_data = {k: v for k, v in openai_data.items() if v is not None}
+        elif source == "ollama":
+            api_endpoint = OLLAMA_API_ENDPOINT
+            keep_alive = data.get('keep_alive', DEBUG_OUTPUT)
+            messages = data.get('messages',[{}])
+            openai_data = data
+            ollama_messages = []
+            for message in messages:
+                ollama_message = {
+                    'role': message.get('role'),
+                }
+                content = message.get('content')
+                images = message.get('images', None)
+                ollama_content = []
+                if images:
+                    ollama_text = {
+                        'type': 'text',
+                        'text': content
+                    }
+                    ollama_content.append(ollama_text)
+                    for image in images:
+                        ollama_image = {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image}"
+                            }
+                        }
+                        ollama_content.append(ollama_image)
+                    
+                    ollama_message['content'] = ollama_content
+                else:
+                    ollama_message['content'] = content
+                ollama_messages.append(ollama_message)
+            openai_data['messages'] = ollama_messages
+            openai_data['keep_alive'] = keep_alive
+        else:
+            yield json.dumps({"error": "Unknown model source"}).encode('utf-8') + b"\n\n"
+            model_server.release_model_lock()
+            return
+        if DEBUG_OUTPUT or REQUEST_PRINT:
+            print(f"\n---------------------------------\nModified /api/chat request:\n\n{openai_data}\n\n---------------------------------\n")
+        try:
+            if openai_data.get("stream"):
+                with requests.post(f"{api_endpoint}/v1/chat/completions", json=openai_data, stream=True) as resp:
+                    if DEBUG_OUTPUT or RESPONSE_PRINT:
+                        print("Started streaming /v1/chat/completions response:\n\n", end="", flush=True)
+                    for line in resp.iter_lines():
+                        if line:
+                            line = line.decode('utf-8')
+                            #print(line)
+                            if line.startswith('data: '):
+                                line = line[5:]
+                            if line.strip() == '[DONE]':
+                                logging.debug("Received [DONE] signal. Finishing response stream.")
+                                break
+                            try:
+                                openai_response = json.loads(line)
+                            except json.JSONDecodeError:
+                                logging.error(f"Failed to decode JSON: {line}")
+                                continue
+                            delta = openai_response.get("choices", [{}])[0].get("delta", {})
+                            role = delta.get("role", "")
+                            content = delta.get("content", "")
+                            is_done = openai_response.get("finish_reason", "") == "stop"
                             ollama_response = {
                                 "model": ollama_model,
                                 "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-                                "done": True
+                                "message": {"role": role, "content": content, "images": None},
+                                "done": is_done
                             }
                             yield json.dumps(ollama_response).encode('utf-8') + b"\n"
-                            logging.debug(f"Final Ollama response: {json.dumps(ollama_response, ensure_ascii=False)}")
-                else:
-                    with requests.post(f"{endpoint}/v1/chat/completions", json=openai_data, stream=False) as resp:
-                        if resp.status_code == 200:
-                            try:
-                                openai_response = resp.json()
-                            except json.JSONDecodeError:
-                                logging.error(f"Failed to decode JSON: {resp.text}")
-                                yield json.dumps({"error": "Failed to decode JSON response"}).encode('utf-8') + b"\n\n"
-                                return
-                            message = openai_response.get("choices", [{}])[0].get("message", {})
-                            role = message.get("role", "")
-                            content = message.get("content", "")
-                            is_done = openai_response.get("finish_reason", "") == "stop"
-                        else:
-                            role, content, is_done = "", "", False
+                            model_server.last_access_time = time.time()
+                            if DEBUG_OUTPUT or RESPONSE_PRINT:
+                                try:
+                                    print(content, end="", flush=True)
+                                except Exception as e:
+                                    logging.debug(f"Can't print content. {e}")
+                    else:
                         ollama_response = {
                             "model": ollama_model,
                             "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-                            "message": {"role": role, "content": content, "images": None},
-                            "done": is_done
+                            "done": True
                         }
                         yield json.dumps(ollama_response).encode('utf-8') + b"\n"
-                        model_server.last_access_time = time.time()
                         logging.debug(f"Final Ollama response: {json.dumps(ollama_response, ensure_ascii=False)}")
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Request failed: {e}")
-                yield f"error: {str(e)}\n\n".encode('utf-8')
+                    if DEBUG_OUTPUT or RESPONSE_PRINT:
+                        print(f"\n\n---------------------------------\n")
+            else:
+                resp = requests.post(f"{api_endpoint}/v1/chat/completions", json=openai_data, stream=False)
+                if resp.status_code == 200:
+                    try:
+                        openai_response = resp.json()
+                    except json.JSONDecodeError:
+                        logging.error(f"Failed to decode JSON: {resp.text}")
+                        yield json.dumps({"error": "Failed to decode JSON response"}).encode('utf-8') + b"\n\n"
+                        return
+                    message = openai_response.get("choices", [{}])[0].get("message", {})
+                    role = message.get("role", "")
+                    content = message.get("content", "")
+                    is_done = openai_response.get("finish_reason", "") == "stop"
+                else:
+                    role, content, is_done = "", "", False
+                yield json.dumps({
+                    "model": ollama_model,
+                    "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+                    "message": {"role": role, "content": content, "images": None},
+                    "done": is_done
+                }).encode('utf-8') + b"\n"
+                model_server.last_access_time = time.time()
+                logging.debug("Ollama response done.")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed: {e}")
+            yield f"error: {str(e)}\n\n".encode('utf-8')
+        finally:
+            model_server.release_model_lock()
     return Response(stream_with_context(generate()),
-                    content_type="text/event-stream" if request.json.get('stream', True) else "application/json")
+                    content_type="text/event-stream" if request.json.get('stream', True) else "application/json",
+                    direct_passthrough=True)
 
 @app.route('/api/generate', methods=['POST'])
 @require_api_key
 def ollama_generate():
     def generate():
-        with model_server.process_lock:
-            data = request.json
-            logging.debug(f"Received Ollama generate request data: {json.dumps(data, ensure_ascii=False)}")
-            is_stream = data.get('stream', True)
-            ollama_model = data.get('model')
-            if ':exl2' in ollama_model:
-                ollama_model = ollama_model.split(':')[0]
-            data['model'] = ollama_model
-
-            if not ollama_model:
-                logging.debug("Ollama Model ID is required")
-                yield json.dumps({"error": "Model ID is required"}).encode('utf-8') + b"\n\n"
-                return
-            model_info = get_model_info(ollama_model)
-            if not model_info:
-                logging.debug("Ollama Model not found")
-                yield json.dumps({"error": "Model not found"}).encode('utf-8') + b"\n\n"
-                return
-            source = model_info['source']
-            success, error_message = prepare_model_request(data)
-            if not success:
-                if is_stream:
-                    yield json.dumps({"error": error_message}).encode('utf-8') + b"\n\n"
-                    return
-                yield json.dumps({"error": error_message}).encode('utf-8') + b"\n\n"
-                return
-
-            if source == "tabbyAPI":
-                endpoint = TABBY_API_ENDPOINT
-                openai_data = {
-                    "prompt": data.get('prompt', ''),
-                    "suffix": data.get('suffix', ''),
-                    "stream": is_stream
-                }
-                template = model_server.model_template or {}
-                update_from_template(openai_data, template)
-                options = data.get('options', {})
-                ollama_update_from_options(openai_data, options)
-                openai_data = {k: v for k, v in openai_data.items() if v is not None}
-            elif source == "ollama":
-                endpoint = OLLAMA_API_ENDPOINT
-                openai_data = data
-            else:
-                yield json.dumps({"error": "Unknown model source"}).encode('utf-8') + b"\n\n"
-                return
-
-            logging.debug(f"Final OpenAI request data: {json.dumps(openai_data, ensure_ascii=False)}")
-            try:
-                if openai_data.get("stream"):
-                    with requests.post(f"{endpoint}/v1/completions", json=openai_data, stream=True) as resp:
-                        for line in resp.iter_lines():
-                            if line:
-                                line_str = line.decode('utf-8')
-                                if line_str.startswith('data: '):
-                                    line_str = line_str[5:]
-                                if line_str.strip() == '[DONE]':
-                                    logging.debug("Received [DONE] signal. Finishing response stream.")
-                                    break
-                                try:
-                                    openai_response = json.loads(line_str)
-                                except json.JSONDecodeError:
-                                    logging.error(f"Failed to decode JSON: {line_str}")
-                                    continue
-                                text = openai_response.get("choices", [{}])[0].get("text", "")
-                                is_done = openai_response.get("finish_reason", "") == "stop"
-                                if DEBUG_OUTPUT:
-                                    print(text, end="", flush=True)
-                                ollama_response = {
-                                    "model": ollama_model,
-                                    "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-                                    "response": text,
-                                    "done": is_done
-                                }
-                                yield json.dumps(ollama_response).encode('utf-8') + b"\n\n"
-                        else:
-                            ollama_response = {
-                                "model": ollama_model,
-                                "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
-                                "response": "",
-                                "done": True
-                            }
-                            yield json.dumps(ollama_response).encode('utf-8') + b"\n\n"
-                            logging.debug(f"Final Ollama response: {json.dumps(ollama_response, ensure_ascii=False)}")
-                else:
-                    with requests.post(f"{endpoint}/v1/completions", json=openai_data, stream=False) as resp:
-                        if resp.status_code == 200:
+        data = request.json
+        logging.debug(f"Received Ollama generate request data: {json.dumps(data, ensure_ascii=False)}")
+        is_stream = data.get('stream', True)
+        ollama_model = data.get('model')
+        if ':exl2' in ollama_model:
+            ollama_model = ollama_model.split(':')[0]
+        data['model'] = ollama_model
+        if not ollama_model:
+            logging.debug("Ollama Model ID is required")
+            yield json.dumps({"error": "Model ID is required"}).encode('utf-8') + b"\n\n"
+            return
+        model_info = get_model_info(ollama_model)
+        if not model_info:
+            logging.debug("Ollama Model not found")
+            yield json.dumps({"error": "Model not found"}).encode('utf-8') + b"\n\n"
+            return
+        source = model_info['source']
+        success, error_message = model_server.acquire_model_lock(data)
+        if not success:
+            yield json.dumps({"error": error_message}).encode('utf-8') + b"\n\n"
+            return
+        if source == "tabbyAPI":
+            api_endpoint = TABBY_API_ENDPOINT
+            openai_data = {
+                "prompt": data.get('prompt', ''),
+                "suffix": data.get('suffix', ''),
+                "stream": is_stream
+            }
+            template = model_server.model_template or {}
+            update_from_template(openai_data, template)
+            options = data.get('options', {})
+            ollama_update_from_options(openai_data, options)
+            openai_data = {k: v for k, v in openai_data.items() if v is not None}
+        elif source == "ollama":
+            api_endpoint = OLLAMA_API_ENDPOINT
+            openai_data = data
+        else:
+            yield json.dumps({"error": "Unknown model source"}).encode('utf-8') + b"\n\n"
+            model_server.release_model_lock()
+            return
+        logging.debug(f"Final OpenAI request data: {json.dumps(openai_data, ensure_ascii=False)}")
+        try:
+            if openai_data.get("stream"):
+                with requests.post(f"{api_endpoint}/v1/completions", json=openai_data, stream=True) as resp:
+                    for line in resp.iter_lines():
+                        if line:
+                            line_str = line.decode('utf-8')
+                            if line_str.startswith('data: '):
+                                line_str = line_str[5:]
+                            if line_str.strip() == '[DONE]':
+                                logging.debug("Received [DONE] signal. Finishing response stream.")
+                                break
                             try:
-                                openai_response = resp.json()
+                                json.loads(line_str)
                             except json.JSONDecodeError:
-                                logging.error(f"Failed to decode JSON: {resp.text}")
-                                yield json.dumps({"error": "Failed to decode JSON response"}).encode('utf-8') + b"\n\n"
-                                return
-                            text = openai_response.get("choices", [{}])[0].get("text", "")
-                            is_done = openai_response.get("finish_reason", "") == "stop"
+                                logging.error(f"Failed to decode JSON: {line_str}")
+                                continue
+                            text = json.loads(line_str).get("choices", [{}])[0].get("text", "")
+                            is_done = json.loads(line_str).get("finish_reason", "") == "stop"
                             if DEBUG_OUTPUT:
                                 print(text, end="", flush=True)
-                            ollama_response = {
+                            yield json.dumps({
                                 "model": ollama_model,
                                 "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
                                 "response": text,
                                 "done": is_done
-                            }
-                            yield json.dumps(ollama_response).encode('utf-8') + b"\n\n"
-                            model_server.last_access_time = time.time()
-                            logging.debug(f"Final Ollama response: {json.dumps(ollama_response, ensure_ascii=False)}")
-                        else:
-                            logging.error(f"Request failed with status code: {resp.status_code}")
-                            yield json.dumps({"error": f"Request failed with status code: {resp.status_code}"}).encode('utf-8') + b"\n\n"
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Ollama generate request failed: {e}")
-                yield f"error: {str(e)}\n\n".encode('utf-8')
-    return Response(stream_with_context(generate()),
-                    content_type="text/event-stream" if request.json.get('stream', True) else "application/json")
+                            }).encode('utf-8') + b"\n\n"
+                    else:
+                        yield json.dumps({
+                            "model": ollama_model,
+                            "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+                            "response": "",
+                            "done": True
+                        }).encode('utf-8') + b"\n\n"
+                        logging.debug("Final Ollama response sent.")
+            else:
+                resp = requests.post(f"{api_endpoint}/v1/completions", json=openai_data, stream=False)
+                if resp.status_code == 200:
+                    try:
+                        openai_response = resp.json()
+                    except json.JSONDecodeError:
+                        logging.error(f"Failed to decode JSON: {resp.text}")
+                        yield json.dumps({"error": "Failed to decode JSON response"}).encode('utf-8') + b"\n\n"
+                        return
+                    text = openai_response.get("choices", [{}])[0].get("text", "")
+                    is_done = openai_response.get("finish_reason", "") == "stop"
+                    if DEBUG_OUTPUT:
+                        print(text, end="", flush=True)
+                    yield json.dumps({
+                        "model": ollama_model,
+                        "created_at": datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+                        "response": text,
+                        "done": is_done
+                    }).encode('utf-8') + b"\n\n"
+                    model_server.last_access_time = time.time()
+                    logging.debug("Final Ollama response sent.")
+                else:
+                    logging.error(f"Request failed with status code: {resp.status_code}")
+                    yield json.dumps({"error": f"Request failed with status code: {resp.status_code}"}).encode('utf-8') + b"\n\n"
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Ollama generate request failed: {e}")
+            yield f"error: {str(e)}\n\n".encode('utf-8')
+        finally:
+            model_server.release_model_lock()
+    return Response(stream_with_context(stream_with_release(generate(), lambda: None)),
+                    content_type="text/event-stream" if request.json.get('stream', True) else "application/json",
+                    direct_passthrough=True)
+
+@app.route('/api/embeddings', methods=['POST'])
+@require_api_key
+def ollama_embeddings():
+    data = request.json
+    logging.debug(f"Received embeddings request data: {json.dumps(data, ensure_ascii=False)}")
+    requested_model = data.get('model')
+    prompt = data.get('prompt')
+    is_stream = data.get('stream', False)
+    if not requested_model:
+        return jsonify({"error": "Model ID is required"}), 400
+    if not prompt:
+        return jsonify({"error": "Prompt is required"}), 400
+    model_info = get_model_info(requested_model)
+    if not model_info:
+        return jsonify({"error": "Model not found"}), 404
+    success, error_message = model_server.acquire_model_lock(data)
+    if not success:
+        if is_stream:
+            return Response(stream_with_context(stream_error_gen(error_message)()), content_type="application/json")
+        return jsonify({"error": error_message}), 400
+    try:
+        source = model_info['source']
+        if source == "tabbyAPI":
+            return jsonify({"error": "Embeddings generation is not supported for this model source"}), 500
+        elif source == "ollama":
+            api_endpoint = OLLAMA_API_ENDPOINT
+            openai_data = {
+                "model": requested_model,
+                "input": prompt,
+                "stream": is_stream
+            }
+            options = data.get('options', {})
+            ollama_update_from_options(openai_data, options)
+            openai_data = {k: v for k, v in openai_data.items() if v is not None}
+        else:
+            return jsonify({"error": "Unknown model source"}), 500
+        logging.debug(f"Final OpenAI request data for embeddings: {json.dumps(openai_data, ensure_ascii=False)}")
+        try:
+            if is_stream:
+                return jsonify({"error": "Streaming is not supported for embeddings"}), 400
+            else:
+                resp = requests.post(f"{api_endpoint}/v1/embeddings", json=openai_data, timeout=3600)
+                if resp.status_code == 200:
+                    try:
+                        result = resp.json()
+                    except json.JSONDecodeError:
+                        return jsonify({"error": "Failed to decode JSON response from model server."})
+                    embedding = result.get("data", [{}])[0].get("embedding", [])
+                    created_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+                    ollama_response = {
+                        "embedding": embedding,
+                        "created_at": created_at
+                    }
+                    return jsonify(ollama_response)
+                else:
+                    logging.error(f"Request failed with status code: {resp.status_code}")
+                    return jsonify({"error": f"Request failed with status code: {resp.status_code}"}), resp.status_code
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Ollama embeddings request failed: {e}")
+            return jsonify({"error": str(e)}), 500
+    finally:
+        model_server.release_model_lock()
 
 if __name__ == '__main__':
     app.run(host=PROXY_HOST, port=PROXY_PORT, debug=FLASK_DEBUG)
