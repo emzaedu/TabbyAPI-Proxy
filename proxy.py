@@ -7,8 +7,8 @@ from functools import wraps
 DEBUG_OUTPUT = True
 FLASK_DEBUG = True
 
-REQUEST_PRINT = False
-RESPONSE_PRINT = False
+REQUEST_PRINT = True
+RESPONSE_PRINT = True
 
 PROXY_HOST = '127.0.0.1'
 PROXY_PORT = 9000
@@ -139,6 +139,8 @@ class ModelServer:
                 self.lock.notify_all()
 
     def switch_worker(self):
+        MAX_RETRIES = 3
+        retry_count = {}
         while True:
             with self.lock:
                 if self.active_requests > 0 or self.switch_queue.empty():
@@ -157,13 +159,21 @@ class ModelServer:
                 if success:
                     old_model = self.current_model
                     self.current_model = target_model
-                    logging.info(f"switch_worker: Model switched from '{old_model}' to '{target_model}'")
+                    logging.debug(f"switch_worker: Model switched from '{old_model}' to '{target_model}'")
                     self.lock.notify_all()
                     event.set()
+                    if target_model in retry_count:
+                        del retry_count[target_model]
                 else:
                     logging.error(f"switch_worker: Failed to switch to '{target_model}': {err}")
-                    self.switch_queue.put((target_model, event))
+                    retry_count[target_model] = retry_count.get(target_model, 0) + 1
+                    if retry_count[target_model] > MAX_RETRIES:
+                        logging.error(f"switch_worker: Abandoning switch request for '{target_model}' after {MAX_RETRIES} attempts")
+                        event.set()
+                    else:
+                        self.switch_queue.put((target_model, event))
             time.sleep(0.1)
+
 
     def stop_model_process(self):
         try:
@@ -173,7 +183,17 @@ class ModelServer:
                 self.stop_model_process_ollama(self.current_model)
         except Exception as e:
             logging.error(f"Error stopping model process: {e}")
-
+            
+    def handle_process_output(self, pipe):
+        for line in iter(pipe.readline, ''):
+            try:
+                decoded_line = line.decode('utf-8', errors='replace').strip()
+            except Exception:
+                decoded_line = str(line)
+            if "Metrics" in decoded_line:
+                logging.info(f"Filtered output: {decoded_line}")
+        pipe.close()
+        
     def start_model_process_tabby(self, model):
         if hasattr(self, 'current_process') and self.current_process is not None:
             self.stop_model_process()
@@ -208,9 +228,13 @@ class ModelServer:
                 [self.python_executable, "start.py", "--config", config_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                text=True
             )
-        logging.debug(f"start_model_process_tabby: Process for model {model} started with PID {self.current_process.pid}")
+            threading.Thread(target=self.handle_process_output, args=(self.current_process.stdout,), daemon=True).start()
+            threading.Thread(target=self.handle_process_output, args=(self.current_process.stderr,), daemon=True).start()
+
+        logging.info(f"Process for TabbyAPI model {model} started with PID {self.current_process.pid}")
         self.server_ready = False
         self.server_ready_event.clear()
         threading.Thread(target=self.check_server_ready, daemon=True).start()
@@ -225,9 +249,9 @@ class ModelServer:
             try:
                 self.current_process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                logging.warning("stop_model_process_tabby: Terminate failed. Killing process...")
+                logging.debug("stop_model_process_tabby: Terminate failed. Killing process...")
                 self.current_process.kill()
-            logging.debug(f"stop_model_process_tabby: Process with PID {self.current_process.pid} stopped")
+            logging.info(f"Process for TabbyAPI with PID {self.current_process.pid} stopped")
             self.current_process = None
             self.server_ready = False
             self.server_ready_event.clear()
@@ -240,7 +264,7 @@ class ModelServer:
             self.model_template = None
 
     def start_model_process_ollama(self, model):
-        logging.info(f"start_model_process_ollama: Loading Ollama model: {model}")
+        logging.info(f"Loading Ollama model: {model}")
         self.current_model = model
         self.current_source = "ollama"
         self.last_access_time = time.time()
@@ -249,7 +273,7 @@ class ModelServer:
 
     def stop_model_process_ollama(self, model):
         try:
-            logging.info(f"stop_model_process_ollama: Unloading Ollama model: {model}")
+            logging.info(f"Unloading Ollama model: {model}")
             response = requests.post(f"{OLLAMA_API_ENDPOINT}/api/chat", json={"model": model, "messages": [], "keep_alive": 0})
             response.raise_for_status()
             for _ in range(30):
@@ -257,14 +281,14 @@ class ModelServer:
                 ps_response.raise_for_status()
                 ps_data = ps_response.json()
                 if not ps_data.get('models', []):
-                    logging.info(f"stop_model_process_ollama: Model {model} successfully unloaded.")
+                    logging.info(f"Ollama Model {model} successfully unloaded.")
                     break
                 time.sleep(1)
         except requests.exceptions.RequestException as e:
-            logging.error(f"stop_model_process_ollama: Failed to unload model {model}: {e}")
+            logging.debug(f"stop_model_process_ollama: Failed to unload model {model}: {e}")
             return False
         except Exception as e:
-            logging.error(f"stop_model_process_ollama: Unexpected error unloading model {model}: {e}")
+            logging.error(f"Unexpected error unloading Ollama model {model}: {e}")
             return False
         self.current_model = None
         self.current_source = None
@@ -278,7 +302,7 @@ class ModelServer:
             models = response.json().get('models', [])
             return any(m['name'] == model for m in models)
         except requests.exceptions.RequestException as e:
-            logging.error(f"is_ollama_model_loaded: Failed to check model {model}: {e}")
+            logging.debug(f"is_ollama_model_loaded: Failed to check model {model}: {e}")
             return False
 
     def is_server_ready(self, endpoint):
@@ -296,11 +320,11 @@ class ModelServer:
             if self.is_server_ready(endpoint):
                 self.server_ready = True
                 self.server_ready_event.set()
-                logging.debug("check_server_ready: Server is ready.")
+                #logging.info("Server is ready.")
                 break
             time.sleep(1)
         else:
-            logging.error("check_server_ready: Server not ready after 30 seconds. Terminating process.")
+            logging.error("Server not ready after 30 seconds. Terminating process.")
             self.stop_model_process()
 
     def check_last_access_time(self):
@@ -308,7 +332,7 @@ class ModelServer:
             if self.last_access_time is not None:
                 elapsed = time.time() - self.last_access_time
                 if elapsed > self.unload_timer:
-                    logging.info(f"check_last_access_time: No requests for {elapsed} seconds. Stopping model process.")
+                    logging.info(f"No requests for {elapsed} seconds. Stopping model process.")
                     self.stop_model_process()
             time.sleep(5)
 
@@ -477,6 +501,9 @@ def prepare_model_request(data):
     model_server.last_access_time = time.time()
     return True, None
 
+@app.errorhandler(404)
+def page_not_found(e):
+    return jsonify({"error": "Page not found"}), 404
 
 @app.route('/', methods=['GET'])
 @require_api_key
@@ -566,14 +593,18 @@ def chat_completions():
     success, error_message = model_server.acquire_model_lock(data)
     if not success:
         if is_stream:
-            return Response(stream_with_context(stream_error_gen(error_message)()), content_type="application/json")
-        return jsonify({"error": error_message})
+            return Response(stream_with_context(stream_error_gen(error_message)()),
+                            content_type="application/json"), 500
+        return jsonify({"error": error_message}), 500
     if model_info['source'] == "tabbyAPI":
         api_endpoint = TABBY_API_ENDPOINT
         template = model_server.model_template or {}
         update_from_template(data, template)
         inject_system_message(data, template)
         openai_data = data
+        openai_data["stream_options"] ={
+            "include_usage": True
+        }
     elif model_info['source'] == "ollama":
         api_endpoint = OLLAMA_API_ENDPOINT
         openai_data = data
@@ -593,6 +624,7 @@ def chat_completions():
                         if line:
                             yield line + b"\n\n"
                             line_decoded = line.decode('utf-8')
+                            #print(line_decoded)
                             if line_decoded.startswith('data: '):
                                 line_decoded = line_decoded[5:]
                             if line_decoded.strip() == '[DONE]':
@@ -602,6 +634,9 @@ def chat_completions():
                                 openai_response = json.loads(line_decoded)
                             except json.JSONDecodeError:
                                 logging.error(f"Failed to decode JSON: {line_decoded}")
+                                continue
+                            if 'usage' in openai_response and openai_response['usage']:
+                                print(openai_response['usage'])
                                 continue
                             delta = openai_response.get("choices", [{}])[0].get("delta", {})
                             if openai_response.get("finish_reason", "") == "":
@@ -724,6 +759,9 @@ def ollama_chat():
             options = data.get('options', {})
             ollama_update_from_options(openai_data, options)
             openai_data = {k: v for k, v in openai_data.items() if v is not None}
+            openai_data["stream_options"] ={
+                "include_usage": True
+            }
         elif source == "ollama":
             api_endpoint = OLLAMA_API_ENDPOINT
             keep_alive = data.get('keep_alive', DEBUG_OUTPUT)
@@ -783,6 +821,9 @@ def ollama_chat():
                             except json.JSONDecodeError:
                                 logging.error(f"Failed to decode JSON: {line}")
                                 continue
+                            if 'usage' in openai_response and openai_response['usage']:
+                                print(openai_response['usage'])
+                                continue
                             delta = openai_response.get("choices", [{}])[0].get("delta", {})
                             role = delta.get("role", "")
                             content = delta.get("content", "")
@@ -831,6 +872,11 @@ def ollama_chat():
                     "message": {"role": role, "content": content, "images": None},
                     "done": is_done
                 }).encode('utf-8') + b"\n"
+                if DEBUG_OUTPUT or RESPONSE_PRINT:
+                    try:
+                        print(content, end="", flush=True)
+                    except Exception as e:
+                        logging.debug(f"Can't print content. {e}")
                 model_server.last_access_time = time.time()
                 logging.debug("Ollama response done.")
         except requests.exceptions.RequestException as e:
@@ -941,7 +987,6 @@ def ollama_generate():
                         "done": is_done
                     }).encode('utf-8') + b"\n\n"
                     model_server.last_access_time = time.time()
-                    logging.debug("Final Ollama response sent.")
                 else:
                     logging.error(f"Request failed with status code: {resp.status_code}")
                     yield json.dumps({"error": f"Request failed with status code: {resp.status_code}"}).encode('utf-8') + b"\n\n"
